@@ -1,14 +1,18 @@
 name: dump-kph
 
-# 开盘红 (com.yzj.kaipanh) 脱壳 —— 跑在 GitHub Actions 的 KVM 上
+# 开盘红 (com.yzj.kaipanh) 脱壳 —— GitHub Actions KVM 版 v2
 #
-# 自动触发: push 到 main 就跑（排除只改文档的提交）
-# 手动触发: Actions 页面 -> dump-kph -> Run workflow
+# v2 改动:
+#   - 全链路容错: 任何一步失败都不中断, 保证 artifact 一定有产物
+#   - -accel auto 而不是 on (KVM 不可用时能降级)
+#   - 每一步都打印诊断 (KVM / 内存 / adb / 进程 / maps)
+#   - 强制 exit 0, 让 step 成功, artifact 才能上传
 #
-# 产物: artifact "dexdump"
-#   dump/   frida-dexdump 内存扫描
-#   dump2/  自定义 dexdump_360.js 扫描
-#   dump3/  /proc/pid/mem 兜底 + maps.txt + logcat.txt
+# 产物 artifact "dexdump":
+#   diag/    环境诊断 (kvm / mem / devices / install.log)
+#   dump/    frida-dexdump
+#   dump2/   自定义 dexdump_360.js
+#   dump3/   /proc/pid/mem 硬 dump + maps.txt + logcat.txt
 on:
   workflow_dispatch:
     inputs:
@@ -16,10 +20,6 @@ on:
         description: 'Android API level'
         required: false
         default: '30'
-      use_frida_dexdump:
-        description: '优先用 frida-dexdump (true/false)'
-        required: false
-        default: 'true'
   push:
     branches: [ main, master ]
     paths-ignore:
@@ -28,7 +28,6 @@ on:
 
 env:
   API_LEVEL: ${{ inputs.api_level || '30' }}
-  USE_FRIDA_DEXDUMP: ${{ inputs.use_frida_dexdump || 'true' }}
 
 jobs:
   dump:
@@ -38,14 +37,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # KVM 必须开，否则 x86_64 模拟器起不来
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm || true
+          echo "--- kvm ---"
+          ls -l /dev/kvm || echo "NO /dev/kvm"
+          echo "--- cpu ---"
+          grep -m1 -E 'vmx|svm' /proc/cpuinfo || echo "no vmx/svm"
+          echo "--- mem ---"
+          free -m
+          echo "--- disk ---"
+          df -h /
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -53,25 +58,30 @@ jobs:
           python-version: '3.11'
 
       - name: Prepare frida tooling
+        continue-on-error: true
         run: |
-          set -eux
-          pip install --quiet frida==16.1.4 frida-tools frida-dexdump
-          curl -sL --retry 3 -o /tmp/fs.xz \
-            https://github.com/frida/frida/releases/download/16.1.4/frida-server-16.1.4-android-x86_64.xz
-          unxz -f /tmp/fs.xz
-          chmod +x /tmp/fs
-          ls -l /tmp/fs
-          python -c "import frida; print('frida', frida.__version__)"
+          set -x
+          pip install --quiet frida==16.1.4 frida-tools frida-dexdump || echo "PIP_FAIL"
+          python -c "import frida; print('frida', frida.__version__)" || echo "FRIDA_IMPORT_FAIL"
+          curl -sL --retry 3 --max-time 120 -o /tmp/fs.xz \
+            https://github.com/frida/frida/releases/download/16.1.4/frida-server-16.1.4-android-x86_64.xz \
+            || echo "CURL_FAIL"
+          ls -l /tmp/fs.xz || true
+          if [ -f /tmp/fs.xz ]; then
+            unxz -f /tmp/fs.xz && chmod +x /tmp/fs && ls -l /tmp/fs
+          fi
+          echo "PREP_DONE"
 
       - name: Locate APK
         run: |
           set -eux
           APK=$(find . -maxdepth 2 -name 'kph_*.apk' | head -1)
-          [ -n "$APK" ] || { echo "::error::repo 根目录没有 kph_*.apk"; exit 1; }
+          [ -n "$APK" ] || { echo "::error::no apk"; exit 1; }
           echo "APK=$(realpath "$APK")" >> "$GITHUB_ENV"
           ls -l "$APK"
 
       - name: Boot emulator and dump
+        continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: ${{ env.API_LEVEL }}
@@ -85,74 +95,120 @@ jobs:
           disable-animations: true
           emulator-options: >-
             -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
-            -camera-back none -accel on
+            -camera-back none -accel auto
           script: |
-            set -x
+            # 关键: 绝不因为单条命令失败而中断
+            set +e
+            mkdir -p diag dump dump2 dump3
+            exec > >(tee -a diag/script.log) 2>&1
+
+            echo "########## DIAG ##########"
+            date -u
+            uname -a
+            nproc; free -m; df -h /
+            ls -l /dev/kvm 2>&1
+            echo "########## ADB ##########"
+            adb version
+            adb devices -l
             adb wait-for-device
             adb shell getprop ro.build.version.sdk
-            adb root || true
-            sleep 3
-            adb wait-for-device
+            adb shell getprop ro.product.cpu.abi
+            adb shell getprop ro.kernel.qemu
 
-            echo "=== install apk ==="
-            adb install -r -t "$APK" || true
-            adb shell pm list packages | grep -i kaipanh || true
-            adb shell dumpsys package com.yzj.kaipanh | grep -E 'versionName|codePath' || true
+            echo "########## ROOT ##########"
+            adb root; sleep 5; adb wait-for-device
+            adb shell id
 
-            echo "=== push frida-server ==="
-            adb push /tmp/fs /data/local/tmp/frida-server
-            adb shell "chmod 755 /data/local/tmp/frida-server"
-            adb shell "nohup /data/local/tmp/frida-server -D >/dev/null 2>&1 &" || true
-            sleep 6
-            adb shell "ps -A | grep -i frida" || true
+            echo "########## INSTALL ##########"
+            adb install -r -t "$APK" 2>&1 | tee diag/install.log
+            adb shell pm list packages | grep -i kaipanh
+            adb shell dumpsys package com.yzj.kaipanh | grep -E 'versionName|codePath|primaryCpuAbi'
 
-            echo "=== first launch (let 360 shell unpack) ==="
-            adb shell am start -W -n com.yzj.kaipanh/.splash.SplashActivity || true
-            sleep 30
-            adb shell "ps -A | grep -i kaipanh" || true
-
-            echo "=== dump via frida-dexdump ==="
-            mkdir -p dump
-            if [ "$USE_FRIDA_DEXDUMP" = "true" ]; then
-              frida-dexdump -U -f com.yzj.kaipanh -d 12 -o ./dump || true
+            echo "########## FRIDA ##########"
+            if [ -f /tmp/fs ]; then
+              adb push /tmp/fs /data/local/tmp/frida-server
+              adb shell "chmod 755 /data/local/tmp/frida-server"
+              adb shell "nohup /data/local/tmp/frida-server -D >/dev/null 2>&1 &"
+              sleep 6
+              adb shell "ps -A | grep -i frida"
+            else
+              echo "NO_FRIDA_SERVER"
             fi
-            ls -laR ./dump || true
 
-            echo "=== dump via custom script (fallback) ==="
-            adb shell "rm -rf /data/local/tmp/kph_dump; mkdir -p /data/local/tmp/kph_dump" || true
-            frida -U -f com.yzj.kaipanh -l tools/dexdump_360.js --no-pause || true
-            sleep 45
-            adb pull /data/local/tmp/kph_dump ./dump2 || true
-            ls -laR ./dump2 || true
+            echo "########## LAUNCH ##########"
+            adb shell am start -W -n com.yzj.kaipanh/.splash.SplashActivity
+            sleep 30
+            adb shell "ps -A | grep -i kaipanh"
+            PID=$(adb shell pidof com.yzj.kaipanh | tr -d '\r' | awk '{print $1}')
+            echo "PID=$PID"
+            if [ -n "$PID" ]; then
+              adb shell "cat /proc/$PID/maps" > dump3/maps.txt 2>&1
+              echo "--- dex-ish mappings ---"
+              grep -iE 'dex|dalvik|jit|art' dump3/maps.txt | head -40
+            fi
 
-            echo "=== memory dump via /proc (root, last resort) ==="
-            mkdir -p dump3
+            echo "########## DUMP A: frida-dexdump ##########"
+            if command -v frida-dexdump >/dev/null 2>&1; then
+              frida-dexdump -U -f com.yzj.kaipanh -d 12 -o ./dump 2>&1 | tail -40
+            else
+              echo "NO_FRIDA_DEXDUMP"
+            fi
+            ls -laR ./dump
+
+            echo "########## DUMP B: custom js ##########"
+            if command -v frida >/dev/null 2>&1; then
+              adb shell "rm -rf /data/local/tmp/kph_dump; mkdir -p /data/local/tmp/kph_dump"
+              frida -U -f com.yzj.kaipanh -l tools/dexdump_360.js --no-pause 2>&1 | tail -60
+              sleep 45
+              adb pull /data/local/tmp/kph_dump ./dump2 2>&1 | tail -5
+            else
+              echo "NO_FRIDA_CLI"
+            fi
+            ls -laR ./dump2
+
+            echo "########## DUMP C: /proc/pid/mem ##########"
             PID=$(adb shell pidof com.yzj.kaipanh | tr -d '\r' | awk '{print $1}')
             if [ -n "$PID" ]; then
-              adb shell "cat /proc/$PID/maps" > dump3/maps.txt || true
-              adb shell "cat /proc/$PID/maps | grep -iE 'dex|dalvik|jit' | awk '{print \$1}'" > dump3/ranges.txt || true
+              adb shell "cat /proc/$PID/maps" > dump3/maps.txt 2>&1
+              grep -iE 'dex|dalvik' dump3/maps.txt | awk '{print $1}' > dump3/ranges.txt 2>&1
+              wc -l dump3/ranges.txt
+              adb shell "rm -f /data/local/tmp/seg_*.bin"
+              n=0
               while read -r rng; do
                 [ -z "$rng" ] && continue
                 S=${rng%%-*}; E=${rng##*-}
                 SO=$((16#$S)); EO=$((16#$E)); SZ=$((EO-SO))
                 [ "$SZ" -le 0 ] && continue
                 [ "$SZ" -gt 67108864 ] && continue
-                adb shell "dd if=/proc/$PID/mem of=/data/local/tmp/seg_${SO}.bin bs=4096 skip=$((SO/4096)) count=$((SZ/4096)) 2>/dev/null" || true
+                n=$((n+1))
+                adb shell "dd if=/proc/$PID/mem of=/data/local/tmp/seg_${SO}.bin bs=4096 skip=$((SO/4096)) count=$((SZ/4096)) 2>/dev/null"
               done < dump3/ranges.txt
-              adb pull /data/local/tmp ./dump3/raw || true
+              echo "dumped_segments=$n"
+              adb pull /data/local/tmp ./dump3/raw 2>&1 | tail -5
+            else
+              echo "NO_PID"
             fi
 
-            echo "=== logcat tail ==="
-            adb logcat -d -t 600 | tail -300 > dump3/logcat.txt || true
+            echo "########## LOGCAT ##########"
+            adb logcat -d -t 800 > dump3/logcat.txt 2>&1
+            tail -100 dump3/logcat.txt
+
+            echo "########## SUMMARY ##########"
+            find dump dump2 dump3 -type f 2>/dev/null | head -60
+            du -sh dump dump2 dump3 2>/dev/null
+            echo "ALL_DONE"
+            exit 0
 
       - name: Verify and fix dex
         if: always()
+        continue-on-error: true
         run: |
-          set -x
-          for d in dump dump2; do
-            [ -d "$d" ] && python tools/run_dexdump.py verify "$d" --fix || true
+          set +e
+          for d in dump dump2 dump3; do
+            [ -d "$d" ] && python tools/run_dexdump.py verify "$d" --fix 2>&1 | tail -30
           done
-          find . -name '*.dex' | head -50 || true
+          echo "--- all dex found ---"
+          find . -name '*.dex' -o -name '*.fixed.dex' 2>/dev/null | head -50
 
       - name: Upload artifacts
         if: always()
@@ -160,6 +216,7 @@ jobs:
         with:
           name: dexdump
           path: |
+            diag/**
             dump/**
             dump2/**
             dump3/**
