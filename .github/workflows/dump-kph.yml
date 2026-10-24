@@ -1,0 +1,167 @@
+name: dump-kph
+
+# 开盘红 (com.yzj.kaipanh) 脱壳 —— 跑在 GitHub Actions 的 KVM 上
+#
+# 自动触发: push 到 main 就跑（排除只改文档的提交）
+# 手动触发: Actions 页面 -> dump-kph -> Run workflow
+#
+# 产物: artifact "dexdump"
+#   dump/   frida-dexdump 内存扫描
+#   dump2/  自定义 dexdump_360.js 扫描
+#   dump3/  /proc/pid/mem 兜底 + maps.txt + logcat.txt
+on:
+  workflow_dispatch:
+    inputs:
+      api_level:
+        description: 'Android API level'
+        required: false
+        default: '30'
+      use_frida_dexdump:
+        description: '优先用 frida-dexdump (true/false)'
+        required: false
+        default: 'true'
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+
+env:
+  API_LEVEL: ${{ inputs.api_level || '30' }}
+  USE_FRIDA_DEXDUMP: ${{ inputs.use_frida_dexdump || 'true' }}
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # KVM 必须开，否则 x86_64 模拟器起不来
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prepare frida tooling
+        run: |
+          set -eux
+          pip install --quiet frida==16.1.4 frida-tools frida-dexdump
+          curl -sL --retry 3 -o /tmp/fs.xz \
+            https://github.com/frida/frida/releases/download/16.1.4/frida-server-16.1.4-android-x86_64.xz
+          unxz -f /tmp/fs.xz
+          chmod +x /tmp/fs
+          ls -l /tmp/fs
+          python -c "import frida; print('frida', frida.__version__)"
+
+      - name: Locate APK
+        run: |
+          set -eux
+          APK=$(find . -maxdepth 2 -name 'kph_*.apk' | head -1)
+          [ -n "$APK" ] || { echo "::error::repo 根目录没有 kph_*.apk"; exit 1; }
+          echo "APK=$(realpath "$APK")" >> "$GITHUB_ENV"
+          ls -l "$APK"
+
+      - name: Boot emulator and dump
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.API_LEVEL }}
+          target: default
+          arch: x86_64
+          profile: pixel_5
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 4096M
+          emulator-boot-timeout: 900
+          disable-animations: true
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -camera-back none -accel on
+          script: |
+            set -x
+            adb wait-for-device
+            adb shell getprop ro.build.version.sdk
+            adb root || true
+            sleep 3
+            adb wait-for-device
+
+            echo "=== install apk ==="
+            adb install -r -t "$APK" || true
+            adb shell pm list packages | grep -i kaipanh || true
+            adb shell dumpsys package com.yzj.kaipanh | grep -E 'versionName|codePath' || true
+
+            echo "=== push frida-server ==="
+            adb push /tmp/fs /data/local/tmp/frida-server
+            adb shell "chmod 755 /data/local/tmp/frida-server"
+            adb shell "nohup /data/local/tmp/frida-server -D >/dev/null 2>&1 &" || true
+            sleep 6
+            adb shell "ps -A | grep -i frida" || true
+
+            echo "=== first launch (let 360 shell unpack) ==="
+            adb shell am start -W -n com.yzj.kaipanh/.splash.SplashActivity || true
+            sleep 30
+            adb shell "ps -A | grep -i kaipanh" || true
+
+            echo "=== dump via frida-dexdump ==="
+            mkdir -p dump
+            if [ "$USE_FRIDA_DEXDUMP" = "true" ]; then
+              frida-dexdump -U -f com.yzj.kaipanh -d 12 -o ./dump || true
+            fi
+            ls -laR ./dump || true
+
+            echo "=== dump via custom script (fallback) ==="
+            adb shell "rm -rf /data/local/tmp/kph_dump; mkdir -p /data/local/tmp/kph_dump" || true
+            frida -U -f com.yzj.kaipanh -l tools/dexdump_360.js --no-pause || true
+            sleep 45
+            adb pull /data/local/tmp/kph_dump ./dump2 || true
+            ls -laR ./dump2 || true
+
+            echo "=== memory dump via /proc (root, last resort) ==="
+            mkdir -p dump3
+            PID=$(adb shell pidof com.yzj.kaipanh | tr -d '\r' | awk '{print $1}')
+            if [ -n "$PID" ]; then
+              adb shell "cat /proc/$PID/maps" > dump3/maps.txt || true
+              adb shell "cat /proc/$PID/maps | grep -iE 'dex|dalvik|jit' | awk '{print \$1}'" > dump3/ranges.txt || true
+              while read -r rng; do
+                [ -z "$rng" ] && continue
+                S=${rng%%-*}; E=${rng##*-}
+                SO=$((16#$S)); EO=$((16#$E)); SZ=$((EO-SO))
+                [ "$SZ" -le 0 ] && continue
+                [ "$SZ" -gt 67108864 ] && continue
+                adb shell "dd if=/proc/$PID/mem of=/data/local/tmp/seg_${SO}.bin bs=4096 skip=$((SO/4096)) count=$((SZ/4096)) 2>/dev/null" || true
+              done < dump3/ranges.txt
+              adb pull /data/local/tmp ./dump3/raw || true
+            fi
+
+            echo "=== logcat tail ==="
+            adb logcat -d -t 600 | tail -300 > dump3/logcat.txt || true
+
+      - name: Verify and fix dex
+        if: always()
+        run: |
+          set -x
+          for d in dump dump2; do
+            [ -d "$d" ] && python tools/run_dexdump.py verify "$d" --fix || true
+          done
+          find . -name '*.dex' | head -50 || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dexdump
+          path: |
+            dump/**
+            dump2/**
+            dump3/**
+          retention-days: 7
+          if-no-files-found: warn
